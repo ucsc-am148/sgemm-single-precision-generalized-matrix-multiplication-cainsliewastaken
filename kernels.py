@@ -134,10 +134,11 @@ def sgemm_smem(A, B, C, M, N, K):
             acc += As[current_row, i] * Bs[i, current_col] #shared memory so no one cares about row hopping in b
         cuda.syncthreads()
 
-        if x < M and y < N:
-            C[x, y] = acc
-        else:
-            C[x, y] = float32(0.0)
+    if x < M and y < N:
+        C[x, y] = acc
+    else:
+        C[x, y] = float32(0.0)
+        
     return
 
 
