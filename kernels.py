@@ -136,8 +136,7 @@ def sgemm_smem(A, B, C, M, N, K):
 
     if x < M and y < N:
         C[x, y] = acc
-    else:
-        C[x, y] = float32(0.0)
+
         
     return
 
