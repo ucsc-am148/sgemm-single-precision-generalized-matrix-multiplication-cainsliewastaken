@@ -14,7 +14,7 @@ To check correctness locally before submitting:
 To submit: push your edits to the main branch of this assignment repo.
 Each push that touches kernels.py triggers the autograder, which runs
 on a Modal A100 40GB and posts your grade as a comment on the commit.
-You have 5 graded submissions per assignment.
+You have 10 graded submissions per assignment.
 """
 import math
 
@@ -72,9 +72,18 @@ def sgemm_coalesced(A, B, C, M, N, K):
     and modulo by BLOCKSIZE. 
     Be careful which one indexes the column.
     """
-    # TODO
-    return
+    
+    current_row = cuda.threadIdx.x // BLOCKSIZE #constant over a single warp
+    current_col = cuda.threadIdx.x % BLOCKSIZE #changes over a single warp
+    x = cuda.blockIdx.x * BLOCKSIZE + current_row #constant over a single warp
+    y = cuda.blockIdx.y * BLOCKSIZE + current_col #changes over a single warp
 
+    if x < M and y < N:
+        tmp = float32(0.0)
+        for i in range(K):
+            tmp += A[x, i] * B[i, y]
+        C[x, y] = tmp
+    return
 
 # ── K3: shared-memory cache-blocking (TODO) ─────────────────────────
 
@@ -97,7 +106,38 @@ def sgemm_smem(A, B, C, M, N, K):
     (BK3, BN3) for Bs.
     Use 0.0 in the SMEM load when the global index is out of bounds.
     """
-    # TODO
+    As = cuda.shared.array((BM3, BK3), float32)
+    Bs = cuda.shared.array((BK3, BN3), float32)
+    current_row = cuda.threadIdx.x // BM3 #constant over a single warp
+    current_col = cuda.threadIdx.x % BN3 #changes over a single warp
+
+    x = cuda.blockIdx.x * BM3 + current_row #constant over a single warp
+    y = cuda.blockIdx.y * BN3 + current_col #changes over a single warp
+
+    acc = float32(0.0)
+    for tile in range(0, K, BK3):
+        a_row = x #constant over a single warp
+        a_col = tile + current_col #changes over a single warp
+        b_row = tile + current_row #constant over a single warp
+        b_col = y #changes over a single warp
+        if a_row < M and a_col < K:
+            As[current_row, current_col] = A[a_row, a_col] #fill temp one column per warp
+        else:
+            As[current_row, current_col] = float32(0.0)
+
+        if b_row < K and b_col < N:
+            Bs[current_row, current_col] = B[b_row, b_col]
+        else:
+            Bs[current_row, current_col] = float32(0.0)
+        cuda.syncthreads()
+        for i in range(BK3):
+            acc += As[current_row, i] * Bs[i, current_col] #shared memory so no one cares about row hopping in b
+        cuda.syncthreads()
+
+        if x < M and y < N:
+            C[x, y] = acc
+        else:
+            C[x, y] = float32(0.0)
     return
 
 
@@ -123,7 +163,55 @@ def sgemm_1d_tile(A, B, C, M, N, K):
     Use cuda.local.array(TM4, float32) for the per-thread accumulator array.
     Initialize all entries to 0.0 before the K-loop.
     """
-    # TODO
+    As = cuda.shared.array((BM4, BK4), float32)
+    Bs = cuda.shared.array((BK4, BN4), float32)
+    acc = cuda.local.array(TM4, float32) #the boujee mem
+
+    for i in range(TM4):
+        acc[i] = float32(0.0)
+
+    #starting ind for each block
+    block_row = cuda.blockIdx.y * BM4 #both cont over warp
+    block_col = cuda.blockIdx.x * BN4 
+
+    a_load_row = cuda.threadIdx.x // BK4 #const over warp
+    a_load_col = cuda.threadIdx.x %  BK4 #changes over warp
+
+    b_load_row = cuda.threadIdx.x // BN4 #const over warp
+    b_load_col = cuda.threadIdx.x %  BN4 #changes over warp
+
+
+    for tile in range(0, K, BK4):
+        a_global_row = block_row + a_load_row 
+        a_global_col = tile + a_load_col
+        if a_global_row < M and a_global_col < K:
+            As[a_load_row, a_load_col] = A[a_global_row, a_global_col]
+        else:
+            As[a_load_row, a_load_col] = float32(0.0)
+        b_global_row = tile + b_load_row
+        b_global_col = block_col + b_load_col
+        if b_global_row < K and b_global_col < N:
+            Bs[b_load_row, b_load_col] = B[b_global_row, b_global_col]
+        else:
+            Bs[b_load_row, b_load_col] = float32(0.0)
+        cuda.syncthreads()
+
+        #inds for the thread shared mem stuff
+        thread_row = cuda.threadIdx.x // BN4 #const over warp
+        thread_col = cuda.threadIdx.x %  BN4 #changes over warp
+        #the k3 calc was done with each thread hitting shared mem, here we reuse the b values
+        for i in range(BK4):
+            b = Bs[i, thread_col] #load a whole column per warp
+            for j in range(TM4):
+                acc[j] += As[thread_row * TM4 + j, i] * b #each acc has 8 values of C
+        cuda.syncthreads()
+
+
+    for i in range(TM4):
+        out_row = block_row + thread_row * TM4 + i
+        if out_row < M and block_col + thread_col < N:
+            C[out_row, block_col + thread_col] = acc[i]
+    
     return
 
 
@@ -148,7 +236,62 @@ def sgemm_2d_tile(A, B, C, M, N, K):
     For accumulators, use cuda.local.array((TM5, TN5), float32).
     Numba supports tuple-shaped local arrays!
     """
-    # TODO
+    As = cuda.shared.array((BM5, BK5), float32)
+    Bs = cuda.shared.array((BK5, BN5), float32)
+    acc = cuda.local.array((TM5, TN5), float32)
+    for i in range(TM5):
+        for j in range(TN5):
+            acc[i, j] = float32(0.0)
+    reg_a = cuda.local.array(TM5, float32)
+    reg_b = cuda.local.array(TN5, float32)
+    bloc_row = cuda.blockIdx.y * BM5 #starting ind for each block
+    block_col = cuda.blockIdx.x * BN5
+
+    tx = cuda.threadIdx.x #does saving this like really make a difference?
+    a_load_row = tx // BK5 #what to load
+    a_load_col = tx % BK5
+    b_load_row = tx // BN5
+    b_load_col = tx % BN5
+
+    thread_row = tx // (BN5 // TN5) #what to use from shared mem
+    thread_col = tx % (BN5 // TN5)
+
+    for tile in range(0, K, BK5): 
+        for i in range(BM5 // (256//BK5)):
+            saved_row = a_load_row + i * (256//BK5)
+            A_row = bloc_row + saved_row 
+            A_col = tile + a_load_col
+            if A_row < M and A_col < K:
+                As[saved_row, a_load_col] = A[A_row, A_col]
+            else:
+                As[saved_row, a_load_col] = float32(0.0)
+
+        for i in range(BK5 // (256//BN5)):
+            saved_row = b_load_row + i * (256//BN5)
+            B_row = tile + saved_row
+            B_col = block_col + b_load_col
+            if B_row < K and B_col < N:
+                Bs[saved_row, b_load_col] = B[B_row, B_col]
+            else:
+                Bs[saved_row, b_load_col] = float32(0.0)
+        cuda.syncthreads()
+
+        for i in range(BK5):
+            for j in range(TM5):
+                reg_a[j] = As[thread_row * TM5 + j, i]
+            for k in range(TN5):
+                reg_b[k] = Bs[i, thread_col * TN5 + k]
+            for j in range(TM5):
+                for k in range(TN5):
+                    acc[j, k] += reg_a[j] * reg_b[k]
+        cuda.syncthreads()
+    for i in range(TM5):
+        out_row = bloc_row + thread_row * TM5 + i
+        if out_row < M:
+            for j in range(TN5):
+                out_col = block_col + thread_col * TN5 + j
+                if out_col < N:
+                    C[out_row, out_col] = acc[i, j]
     return
 
 
@@ -185,7 +328,7 @@ def run_k5(A, B, C, M, N, K):
     sgemm_2d_tile[grid, block](A, B, C, M, N, K)
 
 
-# Graded kernels in the order the rubric uses (1/4 → C, 2/4 → B-, ...).
+# Graded kernels in the order the rubric uses (1/4 → C, 2/4 → C+, 3/4 → B-, 4/4 → B).
 KERNELS = [
     ("k2_coalesce", run_k2),
     ("k3_smem",     run_k3),
